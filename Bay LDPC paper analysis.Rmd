@@ -1,0 +1,926 @@
+---
+title: "Bayesian LDPC analysis"
+author: "Claudio D. Silva Jr"
+output: html_document
+---
+
+<br><br>
+
+# 1. Data
+
+```{r Packages, warning=FALSE, message=FALSE}
+library(readxl) # Import excel files
+library(tidyverse) # Visualization and Wrangling
+library(janitor) # Visualization and Wrangling
+library(rjags) # Packge for Bayesian model implementation - Posterior sampler
+library(gridExtra) # Visualization
+```
+
+```{r Preparation}
+# Read the data
+data <- read_excel("Disease long - FRL.xlsx")
+
+# Calculating y*
+N <- as.numeric(nrow(data))
+data$y_star <- (((data$sev/100)*(N-1))+(1/2))/N
+
+# Prepare data for case studies
+df_cs1 <- data %>%
+  filter(trt %in% c(3, 4), year == "2024", var == "KS18B")
+
+df_cs1_osv <- data %>%
+  filter(trt %in% c(3, 4), year == "2023", var == "KS18B")
+
+df_cs2 <- data %>%
+  filter(trt == 2, year == "2024", var == "SY Monument")
+```
+
+<br><br>
+
+## 1.1. Exploratory
+
+Sup. Fig. 2 is also an exploratory component - Plot of all the curves
+
+```{r Exploratory}
+summary(df_cs1)
+summary(df_cs2)
+```
+
+<br><br>
+
+# 2. Prior prediction
+
+```{r PriorPred}
+# Iteration number and day in which we want to make a prediction
+k <- 5000
+x <- seq(0, 55, by = 1)
+
+# Save the samples
+prior.pred.y <- matrix(NA, nrow = k, ncol = length(x))
+prior.pred.mu <- matrix(NA, nrow = k, ncol = length(x))
+
+sample.y_0 <- rep(0, k)
+sample.K <- rep(0, k)
+sample.r <- rep(0, k)
+sample.phi <- rep(0, k)
+
+set.seed(1996)
+
+for(i in 1:k) {
+  
+  # Sample from assumed prior distributions
+  y_0 = runif(1, 0.001, 0.1)
+  K = rbeta(1, 6, 2)
+  r = runif(1, 0, 0.5)
+  phi = rgamma(1, 24, 2)
+  
+  # Prior predictions
+  ## Process model
+  mu = K/(1 + ((K-y_0)/y_0)*exp(-r*x))
+  
+  ## Prior predictive draws from data model
+  alpha = mu*phi
+  beta = (1-mu)*phi
+  y <- rbeta(length(x), alpha, beta)
+  
+  ## Saving prior predictive draws
+  prior.pred.mu[i, ] <- mu
+  prior.pred.y[i, ] <- y
+  
+  # Save the parameter samples
+  sample.y_0[i] <- y_0
+  sample.K[i] <- K
+  sample.r[i] <- r
+  sample.phi[i] <- phi
+  
+}
+
+# Datasets with prior predictions - Parameters + Simulated y
+par.prior.pred <- data.frame(
+  y_0 = sample.y_0,
+  K = sample.K,
+  r = sample.r,
+  phi = sample.phi
+)
+
+y.prior.pred <- data.frame()
+
+for(i in seq_along(x)){
+  temp <- data.frame(
+    day = x[i],
+    y.sim = prior.pred.y[, i],
+    mu.sim = prior.pred.mu[, i])
+  
+  y.prior.pred <- rbind(y.prior.pred, temp)
+}
+
+# 50 predicted curves (mean)
+ppred_mu <- data.frame(prior.pred.mu)
+ppred_50 <- ppred_mu[sample(nrow(ppred_mu), 50, replace = FALSE), ]
+colnames(ppred_50) <- seq(0, 55, by = 1)
+
+ppred_50$id <- 1:nrow(ppred_50)
+
+ppred_50_l <- pivot_longer(ppred_50, cols = 1:56, values_to = "p_draw", names_to = "time")
+
+ppred_50_l$time <- as.numeric(ppred_50_l$time)
+ppred_50_l <- arrange(ppred_50_l, time, by_group = id)
+```
+
+<br><br>
+
+# 3. Model fit
+
+## 3.1. Case study 1
+
+### 3.1.1. Model fit, posterior prediction, and derived quantities
+
+```{r cs1 model fit}
+# Initialization
+df <- df_cs1
+
+## Posterior prediction and derived quantitity components
+x.new <- seq(1, 55)
+N_pred <- length(x.new)
+lower <- min(x.new)
+upper <- max(x.new)
+
+## Data and initial values
+df <- df %>%
+  mutate(tim_id = case_when(
+    tim == "Feekes 7" ~ 1,
+    tim == "Feekes 9" ~ 2
+  ))
+
+data_lines <- list(
+  "y" = df$y_star, 
+  "tim" = df$tim_id, 
+  "x" = df$time_days, 
+  "N" = nrow(df), 
+  "N_t" = length(unique(df$tim_id)), 
+  "x.new" = x.new, 
+  "N_pred" = N_pred,
+  "lower" = lower,
+  "upper" = upper
+) # Data and sizes of groups
+
+initials <- list(
+  "K" = rep(0.5, length(unique(df$tim_id))), 
+  "y0" = rep(0.05, length(unique(df$tim_id))), 
+  "r" = rep(0.3, length(unique(df$tim_id))), 
+  "phi" = rep(0.1, length(unique(df$tim_id)))
+) # Initial values for each chain
+
+# Writting the model
+
+model_jags_string <- "model {
+  
+  # Model
+  ## Likelihood
+  for(i in 1:N){
+    y[i] ~ dbeta(alpha[i], beta[i])
+    
+    alpha[i] <- mu[i]*phi[tim[i]]
+    beta[i] <- (1-mu[i])*phi[tim[i]]
+    
+    mu[i] <- K[tim[i]]/(1+((K[tim[i]]-y0[tim[i]])/y0[tim[i]])*exp(-r[tim[i]]*x[i]))
+  
+    # Posterior replicated observation for calibration check
+    y_rep[i] ~ dbeta(alpha[i], beta[i])
+  
+  }
+  
+  ## Priors
+  for(t in 1:N_t){
+    phi[t] ~ dgamma(24, 2)
+    K[t] ~ dbeta(6, 2)
+    y0[t] ~ dunif(0.001, 0.1)
+    r[t] ~ dunif(0, 0.5)
+  }
+  
+  # Posterior prediction
+  for(t in 1:N_t){
+    for(j in 1:N_pred){
+      y_pred[t,j] ~ dbeta(alpha.new[t,j], beta.new[t,j])
+      
+      alpha.new[t,j] <- mu.pred[t,j]*phi[t]
+      beta.new[t,j] <- (1-mu.pred[t,j])*phi[t]
+      
+      mu.pred[t,j] <- K[t]/(1+((K[t]-y0[t])/y0[t])*exp(-r[t]*x.new[j]))
+    }
+  }
+  
+  # Derived quantities
+  ## AUDPC
+  for(t in 1:N_t){
+  
+  A[t] <- (K[t] - y0[t])/y0[t]
+  
+  AUDPC[t] <- (K[t]/r[t])*(log(exp(r[t]*upper)+A[t])-log(exp(r[t]*lower)+A[t]))
+  }
+  
+  ## Maximum instantaneous rate of disease increase
+  for(t in 1:N_t){
+  r_star[t] <- (K[t]*r[t])/4
+  }
+  
+  ## Posterior contrasts
+  D_K <- K[1] - K[2]
+  D_r <- r[1] - r[2]
+  D_AUDPC <- AUDPC[1] - AUDPC[2]
+  D_r_star <- r_star[1] - r_star[2]
+  
+}"
+
+# Fitting the model
+m1 <- jags.model(textConnection(model_jags_string), inits = initials, data = data_lines, n.chains = 3) # Initialize the chains
+
+update(m1, n.iter = 5000) # Burn-in / Adaptation
+
+m1_samples <- coda.samples(m1, variable.names = c("K", "r", "y0", "phi", "y_pred", "AUDPC", "y_rep", "r_star", "D_K", "D_r", "D_AUDPC", "D_r_star"), n.iter = 10000) # Samples from the posterior distribution
+
+# Constructing a df with the results
+post_df1 <- as.data.frame(as.matrix(m1_samples))
+```
+
+```{r summaries CS1}
+# K
+mean(post_df1$`K[1]`) # FGS 7
+mean(post_df1$`K[2]`) # FGS 9
+quantile(post_df1$`K[1]`, c(0.025, 0.975))
+quantile(post_df1$`K[2]`, c(0.025, 0.975))
+
+# r
+mean(post_df1$`r[1]`) # FGS 7
+mean(post_df1$`r[2]`) # FGS 9
+quantile(post_df1$`r[1]`, c(0.025, 0.975))
+quantile(post_df1$`r[2]`, c(0.025, 0.975))
+
+# AUDPC
+mean(post_df1$`AUDPC[1]`) # FGS 7
+mean(post_df1$`AUDPC[2]`) # FGS 9
+quantile(post_df1$`AUDPC[1]`, c(0.025, 0.975))
+quantile(post_df1$`AUDPC[2]`, c(0.025, 0.975))
+
+# r_star
+mean(post_df1$`r_star[1]`) # FGS 7
+mean(post_df1$`r_star[2]`) # FGS 9
+quantile(post_df1$`r_star[1]`, c(0.025, 0.975))
+quantile(post_df1$`r_star[2]`, c(0.025, 0.975))
+
+# D_K
+mean(post_df1$D_K)
+quantile(post_df1$D_K, c(0.025, 0.975))
+
+# D_r
+mean(post_df1$D_r)
+quantile(post_df1$D_r, c(0.025, 0.975))
+
+# D_AUDPC
+mean(post_df1$D_AUDPC)
+quantile(post_df1$D_AUDPC, c(0.025, 0.975))
+
+# D_r_star
+mean(post_df1$D_r_star)
+quantile(post_df1$D_r_star, c(0.025, 0.975))
+```
+
+<br><br>
+
+### 3.1.2. Posterior contrast - Probabilities
+
+```{r cs1 post cont}
+# Prob for D_K
+mean(post_df1$D_K>0)
+
+# Prob for D_r
+mean(post_df1$D_r>0)
+
+# Prob for D_AUDPC
+mean(post_df1$D_AUDPC>0)
+
+# Prob for r_star
+mean(post_df1$D_r_star>0)
+```
+
+<br><br>
+
+### 3.1.3. Model diagnostics
+
+```{r cs1 model diag}
+# Samples for diagnostic
+m1_diag <- coda.samples(m1, variable.names = c("K", "r", "y0", "phi"), n.iter = 10000)
+
+# Traceplots - Supplementary Figure 3
+
+# Potetial scale reduction factor (R_hat)
+gelman.diag(m1_diag)
+
+# Effective sample size
+effectiveSize(m1_diag)
+```
+
+<br><br>
+
+### 3.1.4. Posterior predictive checks
+
+```{r cs1 model check}
+# In sample posterior predictive check
+y.rep_df1 <- select(post_df1, starts_with("y_rep"))
+
+y.rep1_sum <- apply(y.rep_df1, 2, quantile, probs = c(0.025, 0.975))
+
+y.rep1_sum <- t(y.rep1_sum)
+
+ppc1_check <- data.frame(
+  tim_id = df$tim_id,
+  observed = df$y_star,
+  PPI.L = y.rep1_sum[, "2.5%"],
+  PPI.U = y.rep1_sum[, "97.5%"]
+)
+
+ppc1_check$covered <- with(ppc1_check, observed >= PPI.L & observed <= PPI.U)
+
+mean(ppc1_check$covered) # Overall
+
+ppc1_check %>%
+  group_by(tim_id) %>%
+  summarise(covered = mean(covered)) # By treatment
+
+# Out of sample posterior predictive check
+post_pred <- post_df1[,c("y_pred[1,31]", "y_pred[1,42]", "y_pred[1,53]", "y_pred[2,31]", "y_pred[2,42]", "y_pred[2,53]")]
+
+post.pred_sum <- apply(post_pred, 2, quantile, probs = c(0.025, 0.975))
+
+post.pred_sum <- t(post.pred_sum)
+
+df_cs1_osv <- df_cs1_osv %>%
+  mutate(
+    PPI.L = case_when(
+      time_days == 31 & tim == "Feekes 7" ~ post.pred_sum[1, 1],
+      time_days == 42 & tim == "Feekes 7" ~ post.pred_sum[2, 1],
+      time_days == 53 & tim == "Feekes 7" ~ post.pred_sum[3, 1],
+      time_days == 31 & tim == "Feekes 9" ~ post.pred_sum[4, 1],
+      time_days == 42 & tim == "Feekes 9" ~ post.pred_sum[5, 1],
+      time_days == 53 & tim == "Feekes 9" ~ post.pred_sum[6, 1]),
+    
+    PPI.U = case_when(
+      time_days == 31 & tim == "Feekes 7" ~ post.pred_sum[1, 2],
+      time_days == 42 & tim == "Feekes 7" ~ post.pred_sum[2, 2],
+      time_days == 53 & tim == "Feekes 7" ~ post.pred_sum[3, 2],
+      time_days == 31 & tim == "Feekes 9" ~ post.pred_sum[4, 2],
+      time_days == 42 & tim == "Feekes 9" ~ post.pred_sum[5, 2],
+      time_days == 53 & tim == "Feekes 9" ~ post.pred_sum[6, 2]))
+
+df_cs1_osv$covered <- with(df_cs1_osv, y_star >= PPI.L & y_star <= PPI.U)
+
+mean(df_cs1_osv$covered) # Overall
+
+df_cs1_osv %>%
+  group_by(tim) %>%
+  summarise(covered = mean(covered)) # By treatment
+```
+
+<br><br>
+
+## 3.2. Case study 2
+
+### 3.2.1. Model fit, posterior prediction, and derived quantities
+
+```{r cs2 model fit}
+# Initialization
+df <- df_cs2
+
+## Posterior prediction components
+x.new <- seq(1, 55)
+N_pred <- length(x.new)
+
+## Data and initial values
+data_lines <- list(
+  "y" = df$y_star, 
+  "x" = df$time_days, 
+  "N" = nrow(df), 
+  "x.new" = x.new, 
+  "N_pred" = N_pred
+) # Data and sizes of groups
+
+initials <- list(
+  "K" = rep(0.5), 
+  "y0" = rep(0.05), 
+  "r" = rep(0.3), 
+  "phi" = rep(0.1)
+) # Initial values for each chain
+
+# Writting the model
+
+model_jags_string <- "model {
+  
+  # Likelihood
+  for(i in 1:N){
+    y[i] ~ dbeta(alpha[i], beta[i])
+    
+    alpha[i] <- mu[i]*phi
+    beta[i] <- (1-mu[i])*phi
+    
+    mu[i] <- K/(1+((K-y0)/y0)*exp(-r*x[i]))
+    
+    # Posterior replicated observation for calibration check
+    y_rep[i] ~ dbeta(alpha[i], beta[i])
+  }
+  
+  # Priors
+    phi ~ dgamma(24, 2)
+    K ~ dbeta(6, 2)
+    y0 ~ dunif(0.001, 0.1)
+    r ~ dunif(0, 0.5)
+  
+  # Posterior prediction
+  for(j in 1:N_pred){
+    y_pred[j] ~ dbeta(alpha.new[j], beta.new[j])
+      
+    alpha.new[j] <- mu.pred[j]*phi
+    beta.new[j] <- (1-mu.pred[j])*phi
+      
+    mu.pred[j] <- K/(1+((K-y0)/y0)*exp(-r*x.new[j]))
+    }
+}"
+
+# Fitting the model
+m2 <- jags.model(textConnection(model_jags_string), inits = initials, data = data_lines, n.chains = 3) # Initialize the chains
+
+update(m2, n.iter = 5000) # Burn-in / Adaptation
+
+m2_samples <- coda.samples(m2, variable.names = c("K", "r", "y0", "phi", "y_pred", "y_rep"), n.iter = 10000) # Samples from the posterior distribution
+
+# Checking results - Example
+post_df2 <- as.data.frame(as.matrix(m2_samples))
+```
+
+```{r summaries CS2}
+# K
+mean(post_df2$K)
+quantile(post_df2$K, c(0.025, 0.975))
+
+# r
+mean(post_df2$r)
+quantile(post_df2$r, c(0.025, 0.975))
+
+# y0
+mean(post_df2$y0)
+quantile(post_df2$y0, c(0.025, 0.975))
+```
+
+<br><br>
+
+### 3.2.2. Model diagnostics
+
+```{r cs2 model diag}
+# Samples for diagnostic 
+m2_diag <- coda.samples(m2, variable.names = c("K", "r", "y0", "phi"), n.iter = 10000)  
+
+# Traceplots - Supplementary Figure 3
+
+# Potetial scale reduction factor (R_hat)
+gelman.diag(m2_diag)
+
+# Effective sample size
+effectiveSize(m2_diag)
+```
+
+<br><br>
+
+### 3.2.3. Posterior predictive check
+
+```{r cs2 model check}
+# In sample posterior predictive check
+y.rep_df2 <- select(post_df2, starts_with("y_rep"))
+
+y.rep2_sum <- apply(y.rep_df2, 2, quantile, probs = c(0.025, 0.975))
+
+y.rep2_sum <- t(y.rep2_sum)
+
+ppc2_check <- data.frame(
+  observed = df$y_star,
+  PPI.L = y.rep2_sum[, "2.5%"],
+  PPI.U = y.rep2_sum[, "97.5%"]
+)
+
+ppc2_check$covered <- with(ppc2_check, observed >= PPI.L & observed <= PPI.U)
+
+mean(ppc2_check$covered)
+```
+
+<br><br>
+
+# 4. Supplementary code
+
+<br><br>
+
+## 4.1. Model with blocks as random
+
+```{r SupCode, eval=FALSE}
+model_jags_string <- "model {
+  
+  # Likelihood
+  for(i in 1:N){
+    y[i] ~ dbeta(alpha[i], beta[i])
+    
+    alpha[i] <- mu[i]*phi
+    beta[i] <- (1-mu[i])*phi
+    
+    mu[i] <- 1/(1+exp(-mu_logit[i]))
+      
+    mu_logit[i] <- log(mu_curve[i]/(1-mu_curve[i])) + b_eff[block[i]]
+    
+    mu_curve[i] <- K[trt[i]]/(1+((K[trt[i]]-y0[trt[i]])/y0[trt[i]])*exp(-r[trt[i]]*x[i]))
+  }
+  
+  # Prior distributions
+  for(t in 1:N_t){
+    K[t] ~ dbeta(6, 2)
+    y0[t] ~ dunif(0.001, 0.1)
+    r[t] ~ dunif(0, 0.5)
+  }
+  
+  phi ~ dgamma(24, 2)
+  tau ~ dgamma(4, 2)
+  
+  for(l in 1:N_b){
+    b_eff[l] ~ dnorm(0, tau)
+  }
+  
+  sigma_b <- 1/sqrt(tau)
+  
+  # Posterior prediction (marginal)
+  
+  b_new ~ dnorm(0, tau)
+  
+  for(t in 1:N_t){
+    for(j in 1:N_pred){
+      y_pred[t,j] ~ dbeta(alpha.new[t,j], beta.new[t,j])
+      
+      alpha.new[t,j] <- mu.pred[t,j]*phi
+      beta.new[t,j] <- (1-mu.pred[t,j])*phi
+      
+      mu.pred[t,j] <- 1/(1+exp(-mu.b[t,j]))
+      
+      mu.b[t,j] <- log(mu.raw[t,j]/(1-mu.raw[t,j])) + b_new
+      
+      mu.raw[t,j] <- K[t]/(1+((K[t]-y0[t])/y0[t])*exp(-r[t]*x.new[j]))
+    }
+  }
+  
+  # Derived quantities (AUDPC)
+  for(t in 1:N_t){
+  
+  A[t] <- (K[t] - y0[t])/y0[t]
+  
+  AUDPC[t] <- (K[t]/r[t])*(log(exp(r[t]*upper)+A[t])-log(exp(r[t]*lower)+A[t]))
+  }
+}"
+```
+
+<br><br>
+
+# 5. Main figures
+
+<br><br>
+
+## Figure 1 - Prior prediction
+
+- Data from: 2. Prior prediction
+
+```{r Fig1}
+y.prior.sum <- y.prior.pred %>%
+  group_by(day) %>%
+  summarise(mean = mean(y.sim), lower = quantile(y.sim, 0.025), upper = quantile(y.sim, 0.975))
+
+fig1_a <- ggplot(y.prior.sum, aes(x = day, y = mean)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3) +
+  geom_line() +
+  theme_classic(base_size = 14) +
+  theme(text = element_text(family = "sans"), plot.tag = element_text(face = "bold", size = 16)) +
+  labs(x = "Day", y = "Prior predicted severity (prop.)", tag = "a")
+
+fig1_b <- ggplot(ppred_50_l, aes(time, p_draw, group = id)) +
+  geom_line() +
+  theme_classic(base_size = 14) +
+  theme(text = element_text(family = "sans"), , plot.tag = element_text(face = "bold", size = 16)) +
+  labs(x = "Day", y = "Prior predicted severity (prop.)", tag = "b")
+
+fig1 <- grid.arrange(fig1_a, fig1_b, ncol = 1)
+
+#ggsave("Fig1.tiff", fig1, width = 170, height = 205, units = "mm", dpi = 600, compression = "lzw") #Half page: 85 mm wide / Full page: 170 mm wide / Max height: 225 mm / 300 dpi
+```
+
+<br><br>
+
+## Figure 2 - CS1 parameter posterior
+
+- Data from: 3.1.1. Model fit, posterior prediction, and derived quantities
+
+```{r Fig2}
+# Individual plots
+K_plot <- ggplot(post_df1) +
+  geom_histogram(aes(post_df1$`K[1]`, after_stat(density), fill = "Feekes 7"), alpha = 0.5, color = "black") +
+  geom_histogram(aes(post_df1$`K[2]`, after_stat(density), fill = "Feekes 9"), alpha = 0.5, color = "black") +
+  labs(y = "[K]", x = "K") +
+  scale_fill_manual(name = "App. timing", values = c("Feekes 7" = "#cf4446", "Feekes 9" = "#781c6d")) +
+  theme(text = element_text(family = "sans")) +
+  theme_classic(base_size = 14)
+
+r_plot <- ggplot(post_df1) +
+  geom_histogram(aes(post_df1$`r[1]`, after_stat(density), fill = "Feekes 7"), alpha = 0.5, color = "black") +
+  geom_histogram(aes(post_df1$`r[2]`, after_stat(density), fill = "Feekes 9"), alpha = 0.5, color = "black") +
+  labs(y = "[r]", x = "r") +
+  scale_fill_manual(name = "App. timing", values = c("Feekes 7" = "#cf4446", "Feekes 9" = "#781c6d")) +
+  theme(text = element_text(family = "sans")) +
+  theme_classic(base_size = 14)
+
+y0_plot <- ggplot(post_df1) +
+  geom_histogram(aes(post_df1$`y0[1]`, after_stat(density), fill = "Feekes 7"), alpha = 0.5, color = "black") +
+  geom_histogram(aes(post_df1$`y0[2]`, after_stat(density), fill = "Feekes 9"), alpha = 0.5, color = "black") +
+  labs(y = expression("["*y[0]*"]"), x = expression(y[0])) +
+  scale_fill_manual(name = "App. timing", values = c("Feekes 7" = "#cf4446", "Feekes 9" = "#781c6d")) +
+  theme(text = element_text(family = "sans")) +
+  theme_classic(base_size = 14)
+
+fig2 <- grid.arrange(K_plot, r_plot, y0_plot, nrow = 3)
+
+#ggsave("Fig2.tiff", fig2, width = 170, height = 205, units = "mm", dpi = 600, compression = "lzw")
+```
+
+<br><br>
+
+## Figure 3 - CS1 contrasts for K and r
+
+- Data from: 3.1.1. Model fit, posterior prediction, and derived quantities
+
+```{r Fig3}
+DK <- ggplot(post_df1, aes(x = D_K)) +
+  geom_histogram(aes(y = after_stat(density)), position = "identity", alpha = 0.4, colour = "black", , fill = "#F18932") +
+  labs(y = expression("[" * Delta[K] * "]"), x = expression(Delta[K]*" = "*K[7]*" - "*K[9]), fill = "Posterior contrast") +
+  geom_vline(aes(xintercept = 0), linetype = 2, colour = "red") +
+  theme_classic()
+
+Dr <- ggplot(post_df1, aes(x = D_r)) +
+  geom_histogram(aes(y = after_stat(density)), position = "identity", alpha = 0.4, colour = "black", , fill = "#F18932") +
+  labs(y = expression("[" * Delta[r] * "]"), x = expression(Delta[r]*" = "*r[7]*" - "*r[9]), fill = "Posterior contrast") +
+  geom_vline(aes(xintercept = 0), linetype = 2, colour = "red") +
+  theme_classic()
+
+fig3 <- grid.arrange(DK, Dr, nrow = 2)
+
+#ggsave("Fig3.tiff", plot = fig3, width = 170, height = 110, units = "mm", dpi = 600, compression = "lzw")
+```
+
+<br><br>
+
+## Figure 4 - CS1 posterior predicted curves
+
+- Data from: 3.1.1. Model fit, posterior prediction, and derived quantities
+
+```{r Fig4}
+post_df <- select(post_df1, starts_with("y_pred"))
+
+post.df_sum <- data.frame(
+  mean = apply(post_df, 2, mean),
+  PPI.L = apply(post_df, 2, quantile, 0.025),
+  PPI.U = apply(post_df, 2, quantile, 0.975)
+)
+
+post.df_sum$id <- row.names(post.df_sum)
+
+post.df_sum <- post.df_sum %>%
+  separate(id, c("id", "temp"), sep = "\\[") %>%
+  separate(temp, c("trt", "day"), sep = ",") %>%
+  mutate(day = gsub("\\]", "", day)) %>%
+  transform(day = as.numeric(day))
+
+fig4 <- ggplot(post.df_sum, aes(day, mean, group = trt, colour = trt, fill = trt)) +
+  geom_line(linewidth = 0.8) + 
+  geom_ribbon(aes(ymin = PPI.L, ymax = PPI.U), alpha = 0.15) +
+  geom_point(data = df_cs1, aes(x = time_days, y = y_star, shape = tim), inherit.aes = FALSE) +
+  scale_discrete_manual(name = "App. timing", aesthetics = c("colour", "fill"), values = c("1" = "#cf4446", "2" = "#781c6d"), labels = c("1" = "Feekes 7", "2" = "Feekes 9")) +
+  theme_classic(base_size = 14) +
+  guides(shape = "none") +
+  labs(y = "Posterior predicted severity (prop.)", x = "Day")
+
+#ggsave("Fig4.tiff", plot = fig4, width = 170, height = 110, units = "mm", dpi = 600, compression = "lzw")
+```
+
+<br><br>
+
+## Figure 5 - CS1 AUDPC
+
+- Data from: 3.1.1. Model fit, posterior prediction, and derived quantities
+
+```{r Fig5}
+fig5 <- ggplot(post_df1) +
+  geom_histogram(aes(post_df1$`AUDPC[1]`, after_stat(density), fill = "Feekes 7"), alpha = 0.5, color = "black") +
+  geom_histogram(aes(post_df1$`AUDPC[2]`, after_stat(density), fill = "Feekes 9"), alpha = 0.5, color = "black") +
+  labs(y = "[AUDPC]", x = "AUDPC") +
+  scale_fill_manual(name = "App. timing", values = c("Feekes 7" = "#cf4446", "Feekes 9" = "#781c6d")) +
+  theme(text = element_text(family = "sans")) +
+  theme_classic(base_size = 14)
+
+#ggsave("Fig5.tiff", plot = fig5, width = 170, height = 110, units = "mm", dpi = 600, compression = "lzw")
+```
+
+<br><br>
+
+## Figure 6 - CS1 r_star
+
+- Data from: 3.1.1. Model fit, posterior prediction, and derived quantities
+
+```{r Fig6}
+fig6 <- ggplot(post_df1) +
+  geom_histogram(aes(post_df1$`r_star[1]`, after_stat(density), fill = "Feekes 7"), alpha = 0.5, color = "black") +
+  geom_histogram(aes(post_df1$`r_star[2]`, after_stat(density), fill = "Feekes 9"), alpha = 0.5, color = "black") +
+  labs(y = expression("["*r["*"]*"]"), x = expression(r["*"])) +
+  scale_fill_manual(name = "App. timing", values = c("Feekes 7" = "#cf4446", "Feekes 9" = "#781c6d")) +
+  theme(text = element_text(family = "sans")) +
+  theme_classic(base_size = 14)
+
+#ggsave("Fig6.tiff", plot = fig6, width = 170, height = 110, units = "mm", dpi = 600, compression = "lzw")
+```
+
+<br><br>
+
+## Figure 7 - CS2 parameter posterior
+
+```{r Fig7}
+# Individual plots
+K2_plot <- ggplot(post_df2) +
+  geom_histogram(aes(post_df2$K, after_stat(density), fill = "Healthy check"), alpha = 0.5, color = "black") +
+  labs(y = "[K]", x = "K") +
+  scale_fill_manual(name = "App. timing", values = ("Healthy check" = "#21538B")) +
+  theme(text = element_text(family = "sans")) +
+  theme_classic(base_size = 14)
+
+r2_plot <- ggplot(post_df2) +
+  geom_histogram(aes(post_df2$r, after_stat(density), fill = "Healthy check"), alpha = 0.5, color = "black") +
+  labs(y = "[r]", x = "r") +
+  scale_fill_manual(name = "App. timing", values = ("Healthy check" = "#21538B")) +
+  theme(text = element_text(family = "sans")) +
+  theme_classic(base_size = 14)
+
+y02_plot <- ggplot(post_df2) +
+  geom_histogram(aes(post_df2$y0, after_stat(density), fill = "Healthy check"), alpha = 0.5, color = "black") +
+  labs(y = expression("["*y[0]*"]"), x = expression(y[0])) +
+  scale_fill_manual(name = "App. timing", values = ("Healthy check" = "#21538B")) +
+  theme(text = element_text(family = "sans")) +
+  theme_classic(base_size = 14)
+
+fig7 <- grid.arrange(K2_plot, r2_plot, y02_plot, nrow = 3)
+
+#ggsave("Fig7.tiff", fig7, width = 170, height = 205, units = "mm", dpi = 600, compression = "lzw")
+```
+
+<br><br>
+
+## Figure 8 - CS2 posterior predicted curves
+
+```{r Fig8}
+post_df <- select(post_df2, starts_with("y_pred"))
+
+post.df_sum <- data.frame(
+  mean = apply(post_df, 2, mean),
+  PPI.L = apply(post_df, 2, quantile, 0.025),
+  PPI.U = apply(post_df, 2, quantile, 0.975)
+)
+
+post.df_sum$id <- row.names(post.df_sum)
+
+post.df_sum <- post.df_sum %>%
+  separate(id, c("id", "day"), sep = "\\[") %>%
+  mutate(day = gsub("\\]", "", day)) %>%
+  transform(day = as.numeric(day))
+
+fig8 <- ggplot(post.df_sum, aes(day, mean, colour = "Healthy check", fill = "Healthy check")) +
+  geom_line(linewidth = 0.8) + 
+  geom_ribbon(aes(ymin = PPI.L, ymax = PPI.U), alpha = 0.15) +
+  geom_point(data = df_cs2, aes(x = time_days, y = y_star, shape = tim), inherit.aes = FALSE) +
+  scale_discrete_manual(name = "App. timing", aesthetics = c("colour", "fill"), values = ("Healthy check" = "#21538B")) +
+  theme_classic(base_size = 14) +
+  guides(shape = "none") +
+  labs(y = "Posterior predicted severity (prop.)", x = "Day")
+
+#ggsave("Fig8.tiff", plot = fig8, width = 170, height = 110, units = "mm", dpi = 600, compression = "lzw")
+```
+
+<br><br>
+
+# 6. Sup. figures
+
+<br><br>
+
+## Supplementary Figure 1
+
+```{r SupFig1}
+set.seed(1996)
+
+prior.fig <- bind_rows(
+  data.frame(par = "K", x = seq(0, 1, length.out = 1000)) %>%
+  mutate(density = dbeta(x, 6, 2)),
+  
+  data.frame(par = "r", x = seq(0, 0.5, length.out = 1000)) %>%
+    mutate(density = dunif(x, 0, 0.5)),
+  
+  data.frame(par = "y0", x = seq(0.001, 0.1, length.out = 1000)) %>%
+    mutate(density = dunif(x, 0.001, 0.1)),
+  
+  data.frame(par = "phi", x = seq(0, 30, length.out = 1000)) %>%
+    mutate(density = dgamma(x, 24, 2))
+  )
+
+SupFig1 <- ggplot(prior.fig, aes(x = x, y = density)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~par, scales = "free", labeller = as_labeller(c(K = "K", r = "r", y0 = "y[0]", phi = "phi"), label_parsed)) +
+  labs(x = "Parameter value", y = "Prior density") +
+  theme_classic(base_size = 12) +
+  theme(strip.text = element_text(size = 14))
+
+#ggsave("SupFig1.tiff", plot = SupFig1, width = 170, height = 110, units = "mm") #Half page: 85 mm wide / Full page: 170 mm wide / Max height: 225 mm / 300 dpi
+```
+
+<br><br>
+
+## Supplementary Figure 2
+
+- Data from: 1. Data
+
+```{r SupFig2}
+data$prod <- fct_relevel(data$prod, c("Nexicor", "Tebustar", "Topguard", "Prosaro", "Headline", "Healthy", "Untreated"))
+data <- data %>%
+  mutate(
+    var_id = case_when(
+      var == "KS18B" ~ "KS 180B",
+      var == "SY Monument" ~ "SY Monument"),
+    
+    season = case_when(
+      year == "2023" ~ "2022-2023",
+      year == "2024" ~ "2023-2024")
+    
+    )
+
+SupFig2 <- ggplot(data, aes(time_days, y_star, colour = tim)) +
+  geom_point() +
+  stat_summary(geom="line", fun=mean) +
+  facet_grid(season*var_id~prod) +
+  theme_classic(base_size = 14) +
+  scale_color_manual(name = "App. timing", aesthetics = c("colour"), values = c("Untreated" = "#09622A", "Healthy" = "#21538B", "Feekes 7" = "#cf4446", "Feekes 9" = "#781c6d")) +
+  labs(y = "y*", x = "Days after FGS 7")
+
+#ggsave("SupFig2.tiff", SupFig2, dpi = 300, units = "mm", width = 300, height = 170)
+```
+
+<br><br>
+
+## Supplementary Figure 3
+
+- Data from: 3.1.3. Model diagnostics
+
+```{r SupFig3}
+# Traceplots m1
+#tiff("SupFig3.tiff", width = 205, height = 255, units = "mm", res = 600)
+
+#par(mfrow = c(4, 2))
+
+traceplot(m1_diag[, 1], main = expression(K*" "*FGS7))  # K1
+traceplot(m1_diag[, 2], main = expression(K*" "*FGS9))  # K2
+
+traceplot(m1_diag[, 5], main = expression(r*" "*FGS7))  # r1
+traceplot(m1_diag[, 6], main = expression(r*" "*FGS9))  # r2
+
+traceplot(m1_diag[, 7], main = expression(y[0]*" "*FGS7))  # y01
+traceplot(m1_diag[, 8], main = expression(y[0]*" "*FGS9))  # y02
+
+traceplot(m1_diag[, 3], main = expression(phi*" "*FGS7))  # phi1
+traceplot(m1_diag[, 4], main = expression(phi*" "*FGS9))  # phi2
+
+#dev.off()
+```
+
+<br><br>
+
+## Supplementary Figure 4
+
+- Data from: 3.2.2. Model diagnostics
+
+```{r SupFig4}
+# Traceplots m2
+#tiff("SupFig4.tiff", width = 205, height = 255, units = "mm", res = 600)
+
+#par(mfrow = c(4, 1))
+
+traceplot(m2_diag[, 1], main = expression(K))  # K
+
+traceplot(m2_diag[, 3], main = expression(r))  # r
+
+traceplot(m2_diag[, 4], main = expression(y[0]))  # y0
+
+traceplot(m2_diag[, 2], main = expression(phi))  # phi
+
+#dev.off()
+```
